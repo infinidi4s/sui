@@ -28,9 +28,10 @@ use sui_types::base_types::ConciseableName;
 use sui_types::base_types::{AuthorityName, EpochId, ObjectID, SequenceNumber, TransactionDigest};
 use sui_types::committee::Committee;
 use sui_types::committee::CommitteeTrait;
-use sui_types::crypto::{AuthoritySignInfo, AuthorityStrongQuorumSignInfo};
+use sui_types::crypto::{AuthoritySignInfo, AuthorityStrongQuorumSignInfo, RandomnessRound};
 use sui_types::digests::ChainIdentifier;
 use sui_types::error::{SuiError, SuiResult};
+use sui_types::randomness_state::get_randomness_state_obj_initial_shared_version;
 use sui_types::signature::GenericSignature;
 use sui_types::storage::InputKey;
 use sui_types::transaction::{
@@ -71,7 +72,7 @@ use move_bytecode_utils::module_cache::SyncModuleCache;
 use mysten_common::sync::notify_once::NotifyOnce;
 use mysten_common::sync::notify_read::NotifyRead;
 use mysten_metrics::monitored_scope;
-use narwhal_types::{RandomnessRound, Round, TimestampMs};
+use narwhal_types::{Round, TimestampMs};
 use prometheus::IntCounter;
 use std::str::FromStr;
 use sui_execution::{self, Executor};
@@ -447,8 +448,9 @@ pub struct AuthorityEpochTables {
     /// Transactions that are being deferred until some future time
     deferred_transactions: DBMap<DeferralKey, Vec<VerifiedSequencedConsensusTransaction>>,
 
-    /// Records the round numbers for which we have written randomness.
-    randomness_rounds_written: DBMap<RandomnessRound, ()>,
+    /// This table is no longer used (can be removed when DBMap supports removing tables)
+    #[allow(dead_code)]
+    randomness_rounds_written: DBMap<narwhal_types::RandomnessRound, ()>,
 
     /// Tables for recording DKG state for RandomnessManager.
 
@@ -464,6 +466,10 @@ pub struct AuthorityEpochTables {
     /// Records the final output of DKG after completion, including the public VSS key and
     /// any local private shares.
     pub(crate) dkg_output: DBMap<u64, dkg::Output<PkG, EncG>>,
+    /// RandomnessRound numbers that are still pending generation.
+    pub(crate) randomness_rounds_pending: DBMap<RandomnessRound, ()>,
+    /// Holds the value of the next RandomnessRound to be generated.
+    pub(crate) randomness_next_round: DBMap<u64, RandomnessRound>,
 }
 
 // DeferralKey requires both the round to which the tx should be deferred (so that we can
@@ -471,11 +477,11 @@ pub struct AuthorityEpochTables {
 // that multiple rounds can efficiently defer to the same future round).
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum DeferralKey {
-    RandomnessRound {
-        future_round: RandomnessRound,
-        deferred_from_round: Round,
-    },
-
+    // TODO-DNS Is it safe to just delete this?
+    // RandomnessRound {
+    //     future_round: RandomnessRound,
+    //     deferred_from_round: Round,
+    // },
     ConsensusRound {
         future_round: Round,
         deferred_from_round: Round,
@@ -483,31 +489,11 @@ pub enum DeferralKey {
 }
 
 impl DeferralKey {
-    fn new_for_randomness_round(future_round: RandomnessRound, deferred_from_round: Round) -> Self {
-        Self::RandomnessRound {
-            future_round,
-            deferred_from_round,
-        }
-    }
-
     fn new_for_consensus_round(future_round: Round, deferred_from_round: Round) -> Self {
         Self::ConsensusRound {
             future_round,
             deferred_from_round,
         }
-    }
-
-    fn range_for_randomness_round(future_round: RandomnessRound) -> (Self, Self) {
-        (
-            Self::RandomnessRound {
-                future_round,
-                deferred_from_round: 0,
-            },
-            Self::RandomnessRound {
-                future_round: future_round.checked_add(1).unwrap(),
-                deferred_from_round: 0,
-            },
-        )
     }
 
     fn range_for_consensus_round(future_round: Round) -> (Self, Self) {
@@ -547,32 +533,16 @@ async fn test_deferral_key_sort_order() {
         let future_round = rand::thread_rng().gen_range(0..u64::MAX);
         let current_round = rand::thread_rng().gen_range(0..u64::MAX);
 
-        let key = if rand::thread_rng().gen() {
-            DeferralKey::new_for_randomness_round(RandomnessRound(future_round), current_round)
-        } else {
-            DeferralKey::new_for_consensus_round(future_round, current_round)
-        };
-
+        let key = DeferralKey::new_for_consensus_round(future_round, current_round);
         db.deferred_certs.insert(&key, &()).unwrap();
     }
 
-    // verify that all random round keys are sorted before all consensus round keys
-    let mut first_consensus_round_seen = false;
     let mut previous_future_round = 0;
     for (key, _) in db.deferred_certs.unbounded_iter() {
         match key {
             DeferralKey::ConsensusRound { future_round, .. } => {
-                if !first_consensus_round_seen {
-                    first_consensus_round_seen = true;
-                    previous_future_round = 0;
-                }
                 assert!(previous_future_round <= future_round);
                 previous_future_round = future_round;
-            }
-            DeferralKey::RandomnessRound { future_round, .. } => {
-                assert!(!first_consensus_round_seen);
-                assert!(previous_future_round <= future_round.0);
-                previous_future_round = future_round.0;
             }
         }
     }
@@ -863,7 +833,7 @@ impl AuthorityPerEpochStore {
             .is_some()
     }
 
-    pub fn set_randomness_manager(
+    pub async fn set_randomness_manager(
         &self,
         randomness_manager: Arc<RandomnessManager>,
     ) -> SuiResult<()> {
@@ -874,7 +844,7 @@ impl AuthorityPerEpochStore {
         {
             error!("`set_randomness_manager` called more than once; this should never happen");
         }
-        randomness_manager.start_dkg()
+        randomness_manager.start_dkg().await
     }
 
     pub fn coin_deny_list_state_exists(&self) -> bool {
@@ -1427,15 +1397,6 @@ impl AuthorityPerEpochStore {
         Ok(())
     }
 
-    fn load_deferred_transactions_for_randomness_round(
-        &self,
-        batch: &mut DBBatch,
-        randomness_round: RandomnessRound,
-    ) -> SuiResult<Vec<VerifiedSequencedConsensusTransaction>> {
-        let (min, max) = DeferralKey::range_for_randomness_round(randomness_round);
-        self.load_deferred_transactions(batch, min, max)
-    }
-
     fn load_deferred_transactions_for_consensus_round(
         &self,
         batch: &mut DBBatch,
@@ -1484,31 +1445,7 @@ impl AuthorityPerEpochStore {
         Ok(txns)
     }
 
-    fn should_defer(
-        &self,
-        cert: &VerifiedExecutableTransaction,
-        commit_round: Round,
-        previously_deferred_tx_digests: &HashSet<TransactionDigest>,
-        last_randomness_round: RandomnessRound,
-    ) -> Option<DeferralKey> {
-        // Defer transaction if it depends on Random object.
-        if cert
-            .shared_input_objects()
-            .any(|obj| obj.id() == SUI_RANDOMNESS_STATE_OBJECT_ID)
-        {
-            // Don't re-defer randomness-using tx.
-            if previously_deferred_tx_digests.contains(cert.digest()) {
-                return None;
-            }
-            return Some(DeferralKey::new_for_randomness_round(
-                // Deferral by two rounds guarantees that the transaction will not depend on
-                // randomness that was revealed but not yet sequenced at the time the transaction
-                // was sequenced.
-                last_randomness_round + 2,
-                commit_round,
-            ));
-        }
-
+    fn should_defer(&self, cert: &VerifiedExecutableTransaction) -> Option<DeferralKey> {
         // placeholder construction to silence lints
         let _ = DeferralKey::new_for_consensus_round(0, 0);
 
@@ -2270,49 +2207,10 @@ impl AuthorityPerEpochStore {
             .db_batch()
             .expect("Consensus should not be processed past end of epoch");
 
-        // Pre-process transactions to find the most recent randomness round included in the commit.
-        let mut last_randomness_round_written = self.last_randomness_round_written()?;
-        // There must be at most one RandomnessStateUpdate per commit.
-        let mut randomness_state_update_found = None;
-        for tx in system_transactions.iter() {
-            let SequencedConsensusTransactionKind::System(tx) = &tx.0.transaction else {
-                unreachable!("system_transactions vector should only contain system transactions")
-            };
-            if let TransactionKind::RandomnessStateUpdate(rsu) =
-                tx.data().intent_message().value.kind()
-            {
-                assert!(
-                    randomness_state_update_found.is_none(),
-                    "found multiple RandomnessStateUpdates in one commit: {:?}, {rsu:?}",
-                    randomness_state_update_found.unwrap(),
-                );
-                randomness_state_update_found = Some(rsu);
-                last_randomness_round_written = std::cmp::max(
-                    last_randomness_round_written,
-                    RandomnessRound(rsu.randomness_round),
-                );
-            }
-        }
-
         // Load transactions deferred from previous commits.
-        // We do this after updating the last_randomness_round_written above so that every deferred
-        // transaction that can be run with this commit is loaded.
         let deferred_tx: Vec<VerifiedSequencedConsensusTransaction> = self
             .load_deferred_transactions_for_consensus_round(&mut batch, commit_round)?
             .into_iter()
-            .chain(self.load_deferred_transactions_for_randomness_round(
-                &mut batch,
-                last_randomness_round_written,
-            )?)
-            .collect();
-        let previously_deferred_tx_digests: HashSet<_> = deferred_tx
-            .iter()
-            .map(|tx| match tx.0.transaction.key() {
-                SequencedConsensusTransactionKey::External(
-                    ConsensusTransactionKey::Certificate(digest),
-                ) => digest,
-                _ => panic!("deferred transaction was not a user certificate: {tx:?}"),
-            })
             .collect();
         sequenced_transactions.extend(deferred_tx.into_iter());
 
@@ -2333,8 +2231,6 @@ impl AuthorityPerEpochStore {
                 checkpoint_service,
                 cache_reader,
                 commit_round,
-                previously_deferred_tx_digests,
-                last_randomness_round_written,
             )
             .await?;
         self.record_consensus_commit_stats(&mut batch, consensus_stats)?;
@@ -2443,8 +2339,6 @@ impl AuthorityPerEpochStore {
         checkpoint_service: &Arc<C>,
         cache_reader: &dyn ExecutionCacheRead,
         commit_round: Round,
-        previously_deferred_tx_digests: HashSet<TransactionDigest>,
-        last_randomness_round: RandomnessRound,
     ) -> SuiResult<(
         Vec<VerifiedExecutableTransaction>,
         Vec<SequencedConsensusTransactionKey>, // keys to notify as complete
@@ -2467,6 +2361,24 @@ impl AuthorityPerEpochStore {
                             .map(|so| so.into_id_and_version())
                     })
                     .collect();
+
+                // As long as we are still accepting consensus certs, each commit also needs
+                // to generate a new round of randomness.
+                if let Some(randomness_obj_initial_shared_version) = self
+                    .epoch_start_config()
+                    .randomness_obj_initial_shared_version()
+                {
+                    // TODO-DNS verify it's ok to use the reconfig lock like this?
+                    if self
+                        .get_reconfig_state_read_lock_guard()
+                        .should_accept_consensus_certs()
+                    {
+                        shared_input_objects.push((
+                            SUI_RANDOMNESS_STATE_OBJECT_ID,
+                            randomness_obj_initial_shared_version,
+                        ));
+                    }
+                }
 
                 shared_input_objects.sort();
                 shared_input_objects.dedup();
@@ -2494,8 +2406,6 @@ impl AuthorityPerEpochStore {
                     tx,
                     checkpoint_service,
                     commit_round,
-                    &previously_deferred_tx_digests,
-                    last_randomness_round,
                 )
                 .await?
             {
@@ -2531,9 +2441,18 @@ impl AuthorityPerEpochStore {
             self.defer_transactions(batch, key, txns)?;
         }
 
-        if randomness_state_updated {
-            if let Some(randomness_manager) = self.randomness_manager.get() {
-                randomness_manager.advance_dkg(batch)?;
+        if let Some(randomness_manager) = self.randomness_manager.get() {
+            if randomness_state_updated {
+                randomness_manager.advance_dkg(batch).await?;
+            }
+
+            if randomness_manager.is_dkg_complete().await {
+                // TODO-DNS add code to reject randomness-using tx before DKG is complete?
+                // Or remove that restriction and have a burst of randomness gen after DKG finishes?
+                // TODO-DNS probably will need to pass in the
+                // object version that will need to be written for the round?
+                randomness_manager.generate_next_randomness(batch).await?;
+                // TODO-DNS increment object version
             }
         }
 
@@ -2659,8 +2578,6 @@ impl AuthorityPerEpochStore {
         transaction: &VerifiedSequencedConsensusTransaction,
         checkpoint_service: &Arc<C>,
         commit_round: Round,
-        previously_deferred_tx_digests: &HashSet<TransactionDigest>,
-        last_randomness_round: RandomnessRound,
     ) -> SuiResult<ConsensusCertificateResult> {
         let _scope = monitored_scope("HandleConsensusTransaction");
         let VerifiedSequencedConsensusTransaction(SequencedConsensusTransaction {
@@ -2707,19 +2624,13 @@ impl AuthorityPerEpochStore {
                 if !self
                     .get_reconfig_state_read_lock_guard()
                     .should_accept_consensus_certs()
-                    && !previously_deferred_tx_digests.contains(certificate.digest())
                 {
                     debug!("Ignoring consensus certificate for transaction {:?} because of end of epoch",
                     certificate.digest());
                     return Ok(ConsensusCertificateResult::Ignored);
                 }
 
-                if let Some(deferral_key) = self.should_defer(
-                    &certificate,
-                    commit_round,
-                    previously_deferred_tx_digests,
-                    last_randomness_round,
-                ) {
+                if let Some(deferral_key) = self.should_defer(&certificate) {
                     debug!(
                         "Deferring consensus certificate for transaction {:?} until {deferral_key:?}",
                         certificate.digest(),
@@ -2824,7 +2735,7 @@ impl AuthorityPerEpochStore {
                             authority.concise()
                         );
                         match bcs::from_bytes(bytes) {
-                            Ok(message) => randomness_manager.add_message(batch, message)?,
+                            Ok(message) => randomness_manager.add_message(batch, message).await?,
                             Err(e) => {
                                 warn!(
                                     "Failed to deserialize RandomnessDkgMessage from {:?}: {e:?}",
@@ -2861,7 +2772,9 @@ impl AuthorityPerEpochStore {
                         );
                         match bcs::from_bytes(bytes) {
                             Ok(confirmation) => {
-                                randomness_manager.add_confirmation(batch, confirmation)?
+                                randomness_manager
+                                    .add_confirmation(batch, confirmation)
+                                    .await?
                             }
                             Err(e) => {
                                 warn!(
@@ -2893,14 +2806,15 @@ impl AuthorityPerEpochStore {
                     return Ok(ConsensusCertificateResult::IgnoredSystem);
                 }
 
-                if let TransactionKind::RandomnessStateUpdate(rsu) =
-                    &system_transaction.data().intent_message().value.kind()
-                {
-                    batch.insert_batch(
-                        &self.tables()?.randomness_rounds_written,
-                        [(RandomnessRound(rsu.randomness_round), ())],
-                    )?;
-                }
+                // TODO-DNS update this code, this "if" can maybe just be deleted?
+                // if let TransactionKind::RandomnessStateUpdate(rsu) =
+                //     &system_transaction.data().intent_message().value.kind()
+                // {
+                // batch.insert_batch(
+                //     &self.tables()?.randomness_rounds_written,
+                //     [(RandomnessRound(rsu.randomness_round), ())],
+                // )?;
+                // }
 
                 // If needed we can support owned object system transactions as well...
                 assert!(system_transaction.contains_shared_object());
@@ -3181,15 +3095,16 @@ impl AuthorityPerEpochStore {
         }
     }
 
-    pub fn last_randomness_round_written(&self) -> SuiResult<RandomnessRound> {
-        Ok(self
-            .tables()?
-            .randomness_rounds_written
-            .unbounded_iter()
-            .skip_to_last()
-            .next()
-            .map_or(RandomnessRound(0), |(round, _)| round))
-    }
+    // TODO-DNS delete?
+    // pub fn last_randomness_round_written(&self) -> SuiResult<RandomnessRound> {
+    //     Ok(self
+    //         .tables()?
+    //         .randomness_rounds_written
+    //         .unbounded_iter()
+    //         .skip_to_last()
+    //         .next()
+    //         .map_or(RandomnessRound(0), |(round, _)| round))
+    // }
 
     pub fn clear_signature_cache(&self) {
         self.signature_verifier.clear_signature_cache();
