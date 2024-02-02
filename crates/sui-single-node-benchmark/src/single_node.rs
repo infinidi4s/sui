@@ -222,7 +222,7 @@ impl SingleValidator {
 
     pub async fn sign_transaction(&self, transaction: Transaction) -> HandleTransactionResponse {
         self.validator_service
-            .handle_transaction_for_testing(transaction)
+            .handle_transaction_for_benchmarking(transaction)
             .await
     }
 

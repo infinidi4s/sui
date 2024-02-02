@@ -29,6 +29,7 @@ use sui_types::crypto::KeypairTraits;
 use sui_types::crypto::NetworkKeyPair;
 use sui_types::crypto::SuiKeyPair;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
+use sui_types::traffic_control::TrafficControlPolicy;
 
 use sui_types::crypto::{get_key_pair_from_rng, AccountKeyPair, AuthorityKeyPair};
 use sui_types::multiaddr::Multiaddr;
@@ -168,6 +169,15 @@ pub struct NodeConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_with_range: Option<RunWithRange>,
+
+    #[serde(default)]
+    pub disable_traffic_control: bool,
+
+    // Controls how the node will handle traffic control. Fine grained control
+    // only needed for tests, thus we skip serializing. For a quick killswitch
+    // on traffic control which is exposed, see `disable_traffic_control`.
+    #[serde(skip)]
+    pub traffic_control_policy: Option<TrafficControlPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
