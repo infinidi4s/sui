@@ -7,7 +7,7 @@ publish = false
 edition = "2021"
 
 [dependencies]
-ethers = "2.0"
+ethers = "2.0.12"
 tokio = { workspace = true, features = ["full"] }
 sui-types.workspace = true
 sui-common.workspace = true
