@@ -160,7 +160,6 @@ pub fn mock_certified_checkpoint<'a>(
 }
 
 mod zk_login {
-    use fastcrypto::traits::EncodeDecodeBase64;
     use fastcrypto_zkp::bn254::{utils::big_int_str_to_bytes, zk_login::ZkLoginInputs};
     use shared_crypto::intent::PersonalMessage;
 
@@ -172,15 +171,14 @@ mod zk_login {
     pub static SHORT_ADDRESS_SEED: &str =
         "380704556853533152350240698167704405529973457670972223618755249929828551006";
 
-    pub fn load_test_vectors() -> Vec<(SuiKeyPair, PublicKey, ZkLoginInputs)> {
+    pub fn load_test_vectors(path: &str) -> Vec<(SuiKeyPair, PublicKey, ZkLoginInputs)> {
         // read in test files that has a list of matching zklogin_inputs and its ephemeral private keys.
-        let file = std::fs::File::open("./src/unit_tests/zklogin_test_vectors.json")
-            .expect("Unable to open file");
+        let file = std::fs::File::open(path).expect("Unable to open file");
 
         let test_datum: Vec<TestData> = serde_json::from_reader(file).unwrap();
         let mut res = vec![];
         for test in test_datum {
-            let kp = SuiKeyPair::decode_base64(&test.kp).unwrap();
+            let kp = SuiKeyPair::decode(&test.kp).unwrap();
             let inputs =
                 ZkLoginInputs::from_json(&test.zklogin_inputs, &test.address_seed).unwrap();
             let pk_zklogin = PublicKey::from_zklogin_inputs(&inputs).unwrap();

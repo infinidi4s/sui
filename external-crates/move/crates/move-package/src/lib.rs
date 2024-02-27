@@ -6,6 +6,7 @@ mod package_lock;
 
 pub mod compilation;
 pub mod lock_file;
+pub mod migration;
 pub mod package_hooks;
 pub mod resolution;
 pub mod source_package;
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use source_package::{layout::SourcePackageLayout, parsed_manifest::DependencyKind};
 use std::{
     collections::BTreeMap,
-    io::{Seek, SeekFrom, Write},
+    io::{BufRead, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -122,6 +123,29 @@ impl BuildConfig {
         BuildPlan::create(resolved_graph)?.compile(writer)
     }
 
+    /// Compile the package at `path` or the containing Move package. Exit process on warning or
+    /// failure. Will trigger migration if the package is missing an edition.
+    pub fn cli_compile_package<W: Write, R: BufRead>(
+        self,
+        path: &Path,
+        writer: &mut W,
+        _reader: &mut R, // Reader here for enabling migration mode
+    ) -> Result<CompiledPackage> {
+        let resolved_graph = self.resolution_graph_for_package(path, writer)?;
+        let _mutx = PackageLock::lock(); // held until function returns
+        let build_plan = BuildPlan::create(resolved_graph)?;
+        // TODO: When we are ready to release and enable automatic migration, uncomment this.
+        // if !build_plan.root_crate_edition_defined() {
+        //     // We would also like to call build here, but the edition is already computed and
+        //     // the lock + build config have been used for this build already. The user will
+        //     // have to call build a second time -- this is reasonable...
+        //     migration::migrate(build_plan, writer, _reader)?;
+        // } else {
+        //     build_plan.compile(writer)
+        // }
+        build_plan.compile(writer)
+    }
+
     /// Compile the package at `path` or the containing Move package. Do not exit process on warning
     /// or failure.
     pub fn compile_package_no_exit<W: Write>(
@@ -132,6 +156,21 @@ impl BuildConfig {
         let resolved_graph = self.resolution_graph_for_package(path, writer)?;
         let _mutx = PackageLock::lock(); // held until function returns
         BuildPlan::create(resolved_graph)?.compile_no_exit(writer)
+    }
+
+    /// Compile the package at `path` or the containing Move package. Exit process on warning or
+    /// failure.
+    pub fn migrate_package<W: Write, R: BufRead>(
+        self,
+        path: &Path,
+        writer: &mut W,
+        reader: &mut R,
+    ) -> Result<()> {
+        let resolved_graph = self.resolution_graph_for_package(path, writer)?;
+        let _mutx = PackageLock::lock(); // held until function returns
+        let build_plan = BuildPlan::create(resolved_graph)?;
+        migration::migrate(build_plan, writer, reader)?;
+        Ok(())
     }
 
     // NOTE: If there are no renamings, then the root package has the global resolution of all named
